@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -247,5 +248,91 @@ func TestConnectAKeyWithNoCreditYet(t *testing.T) {
 	res := connectProvider(context.Background(), connectRequest{ID: "fresh", Name: "Fresh", API: providers.APIChat, Base: srv.URL + "/v1", Key: "sk-or-v1-fresh", Probe: true})
 	if !res.OK || !strings.Contains(res.Answer, "no credit") {
 		t.Fatalf("want connected with the no-credit note, got %+v", res)
+	}
+}
+
+// The menu behind `connect local` lists every default address whose model list
+// answers, in order, and names a runtime by its default port.
+func TestAnsweringRuntimesListsEachThatAnswers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			_, _ = io.WriteString(w, `{"data":[{"id":"a"},{"id":"b"}]}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	}))
+	defer empty.Close()
+
+	saved := localRuntimeBases
+	defer func() { localRuntimeBases = saved }()
+	localRuntimeBases = []string{"http://localhost:1/v1", empty.URL + "/v1", srv.URL + "/v1", srv.URL + "/v1"}
+	found, tried := answeringRuntimes(context.Background())
+	if len(tried) != 4 {
+		t.Fatalf("every address is tried: %v", tried)
+	}
+	if len(found) != 2 || found[0].Base != srv.URL+"/v1" || found[0].Models != 2 || found[0].Name != "a model server" {
+		t.Fatalf("only an address that lists models is offered, models counted: %+v", found)
+	}
+
+	localRuntimeBases = []string{"http://localhost:1/v1"}
+	if found, _ := answeringRuntimes(context.Background()); len(found) != 0 {
+		t.Fatalf("nothing listening offers nothing: %+v", found)
+	}
+	for port, name := range map[string]string{"8090": "janis", "11434": "Ollama", "8080": "llama.cpp", "1234": "LM Studio", "8000": "vLLM"} {
+		if runtimeNames[port] != name {
+			t.Errorf("port %s is %q, not %q", port, runtimeNames[port], name)
+		}
+	}
+}
+
+// Connecting a local runtime from a terminal keeps its tested model as the
+// person's pin, so the next conversation runs on it and not on an older pin.
+func TestConnectingALocalRuntimeSelectsItsModel(t *testing.T) {
+	dir := t.TempDir()
+	old := persistentPinPath
+	persistentPinPath = func() string { return filepath.Join(dir, ".memdoor", "model.json") }
+	t.Cleanup(func() { persistentPinPath = old })
+
+	if err := writePersistentPin("human:me", &persistentPin{Model: "deepseek/deepseek-v4.1-flash-1017"}); err != nil {
+		t.Fatal(err)
+	}
+	connected := connectResult{OK: true, Saved: true, ID: "local", Tested: "Qwen3-1.7B-4bit"}
+
+	for name, req := range map[string]connectRequest{
+		"not asked for":    {Keyless: true},
+		"a keyed provider": {Select: true},
+	} {
+		res := connected
+		selectConnected("human:me", req, &res)
+		if res.Selected != "" || readPersistentPin("human:me").Model != "deepseek/deepseek-v4.1-flash-1017" {
+			t.Fatalf("%s must leave the pin alone: %+v %+v", name, res, readPersistentPin("human:me"))
+		}
+	}
+	for name, res := range map[string]connectResult{
+		"a probe only":  {OK: true, ID: "local", Tested: "m"},
+		"a failed test": {ID: "local", Tested: "m", Saved: true},
+		"no model":      {OK: true, Saved: true, ID: "local"},
+	} {
+		selectConnected("human:me", connectRequest{Keyless: true, Select: true}, &res)
+		if res.Selected != "" {
+			t.Fatalf("%s must not select: %+v", name, res)
+		}
+	}
+
+	res := connected
+	selectConnected("human:me", connectRequest{Keyless: true, Select: true}, &res)
+	if res.Selected != "local:Qwen3-1.7B-4bit" {
+		t.Fatalf("the tested model is reported as selected: %+v", res)
+	}
+	if p := readPersistentPin("human:me"); p == nil || p.Model != "local:Qwen3-1.7B-4bit" {
+		t.Fatalf("the older pin is replaced by the local model: %+v", p)
+	}
+	if readPersistentPin("human:other") != nil {
+		t.Fatal("another person's pin is not written")
 	}
 }

@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"memdoor/gateway/logs"
 	"memdoor/gateway/providers"
+	"memdoor/pkg/authorization"
 	"memdoor/pkg/decision"
 	"memdoor/pkg/decision/systemone"
 	"memdoor/pkg/llm"
@@ -37,6 +40,53 @@ var localRuntimeBases = []string{
 	"http://localhost:11434/v1", // ollama
 	"http://localhost:8080/v1",  // llama-server
 	"http://localhost:1234/v1",  // LM Studio
+	"http://localhost:8000/v1",  // vLLM
+}
+
+// runtimeNames are the runtimes by default port, for the menu.
+var runtimeNames = map[string]string{"8090": "janis", "11434": "Ollama", "8080": "llama.cpp", "1234": "LM Studio", "8000": "vLLM"}
+
+// localRuntime is a default address whose model list answered.
+type localRuntime struct {
+	Name   string `json:"name"`
+	Base   string `json:"base"`
+	Models int    `json:"models"`
+}
+
+// answeringRuntimes asks every default address at once and keeps the ones
+// that list models, in localRuntimeBases order.
+func answeringRuntimes(ctx context.Context) (found []localRuntime, tried []string) {
+	results := make([]*localRuntime, len(localRuntimeBases))
+	var wg sync.WaitGroup
+	for i, base := range localRuntimeBases {
+		tried = append(tried, base)
+		wg.Add(1)
+		go func(i int, base string) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			id := fmt.Sprintf("local-probe-%d", i)
+			list, err := providers.ModelsOf(pctx, providers.Provider{ID: id, API: providers.APIChat, Base: base, Keyless: true})
+			providers.ForgetModels(id)
+			if err != nil || len(list) == 0 {
+				return
+			}
+			name := "a model server"
+			if u, err := url.Parse(base); err == nil {
+				if n, ok := runtimeNames[u.Port()]; ok {
+					name = n
+				}
+			}
+			results[i] = &localRuntime{Name: name, Base: base, Models: len(list)}
+		}(i, base)
+	}
+	wg.Wait()
+	for _, r := range results {
+		if r != nil {
+			found = append(found, *r)
+		}
+	}
+	return found, tried
 }
 
 // findLocalRuntime is the first default address whose model list answers.
@@ -67,6 +117,7 @@ type connectRequest struct {
 	Context int               `json:"context"`
 	Probe   bool              `json:"probe"`   // true: test only, keep nothing
 	Keyless bool              `json:"keyless"` // a local runtime (Ollama, llama.cpp, janis): no token, none sent
+	Select  bool              `json:"select"`  // keep the tested model as the person's pin: every new conversation starts on it
 }
 
 type connectResult struct {
@@ -75,7 +126,8 @@ type connectResult struct {
 	API       string            `json:"api"`
 	Models    int               `json:"models"`
 	Sample    []string          `json:"sample,omitempty"`
-	Tested    string            `json:"tested,omitempty"` // the model the test call used
+	Tested    string            `json:"tested,omitempty"`   // the model the test call used
+	Selected  string            `json:"selected,omitempty"` // the pin kept for the person: provider:model
 	Answer    string            `json:"answer,omitempty"`
 	Error     string            `json:"error,omitempty"`
 	Advice    string            `json:"advice,omitempty"`
@@ -97,6 +149,10 @@ func (s *Server) handleProvidersConnect(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	switch r.Method {
+	case http.MethodGet:
+		found, tried := answeringRuntimes(r.Context())
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimes": found, "tried": tried})
+		return
 	case http.MethodDelete:
 		id := r.URL.Query().Get("id")
 		if err := providers.RemoveProvider(id); err != nil {
@@ -114,7 +170,7 @@ func (s *Server) handleProvidersConnect(w http.ResponseWriter, r *http.Request) 
 		return
 	case http.MethodPost:
 	default:
-		http.Error(w, `{"error": "POST or DELETE"}`, http.StatusMethodNotAllowed)
+		http.Error(w, `{"error": "GET, POST or DELETE"}`, http.StatusMethodNotAllowed)
 		return
 	}
 	var req connectRequest
@@ -125,6 +181,7 @@ func (s *Server) handleProvidersConnect(w http.ResponseWriter, r *http.Request) 
 	// Always 200: a failed probe is an answer in words (error, advice), not
 	// an HTTP error the client would have to unwrap.
 	res := connectProvider(r.Context(), req)
+	selectConnected(string(authorization.GetActorID(r.Context())), req, &res)
 	openRouterKept := res.OK && res.Saved && res.ID == providers.OpenRouterID
 	if openRouterKept {
 		// The OpenRouter path from this turn on: its ladder, its privacy
@@ -138,6 +195,22 @@ func (s *Server) handleProvidersConnect(w http.ResponseWriter, r *http.Request) 
 		s.rewireDecisions() // judges from this turn on, no gateway start needed
 	}
 	_ = json.NewEncoder(w).Encode(res)
+}
+
+// selectConnected keeps the model a local runtime was just tested with as the
+// person's pin (persistent_pin.go), so the next conversation runs on it and not
+// on a pin from before. Only a local runtime that was saved and asked for it:
+// connecting a provider says nothing about which model the person wants.
+func selectConnected(actor string, req connectRequest, res *connectResult) {
+	if !req.Select || !req.Keyless || !res.OK || !res.Saved || res.Tested == "" {
+		return
+	}
+	pin := res.ID + ":" + res.Tested
+	if err := writePersistentPin(actor, &persistentPin{Model: pin}); err != nil {
+		logs.New("Agent").Warn("pin not kept: " + err.Error())
+		return
+	}
+	res.Selected = pin
 }
 
 // connectProvider probes, then saves unless asked only to probe. The API

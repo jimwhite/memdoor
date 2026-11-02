@@ -355,11 +355,18 @@ a wrong URL or token fails here, in words. Kept in ~/.memdoor/providers.json
 			if !term.IsTerminal(int(os.Stdin.Fd())) && pick.Base != "" {
 				base = pick.Base
 			} else {
-				prompt := "Base URL"
-				if pick.Keyless {
-					prompt = "Base URL (blank: find a runtime on the gateway's machine — janis :8090, Ollama :11434, llama.cpp :8080, LM Studio :1234)"
+				if pick.Keyless && term.IsTerminal(int(os.Stdin.Fd())) {
+					var err error
+					if base, err = chooseLocalRuntime(ask, func(t string) { fmt.Print(t) }, janisOffer()); err != nil {
+						return err
+					}
+				} else {
+					prompt := "Base URL"
+					if pick.Keyless {
+						prompt = "Base URL (blank: find a runtime on the gateway's machine — janis :8090, Ollama :11434, llama.cpp :8080, LM Studio :1234, vLLM :8000)"
+					}
+					base = ask(prompt, pick.Base)
 				}
-				base = ask(prompt, pick.Base)
 			}
 		}
 		key, _ := cmd.Flags().GetString("key")
@@ -413,9 +420,11 @@ a wrong URL or token fails here, in words. Kept in ~/.memdoor/providers.json
 			Decisions bool     `json:"decisions"`
 			Base      string   `json:"base"`
 			FreeModel string   `json:"free_model"`
+			Selected  string   `json:"selected"`
 		}
 		err := NewClient().PostJSON("/api/providers/connect", map[string]any{
 			"id": id, "name": pick.Name, "api": pick.API, "base": base, "key": strings.TrimSpace(key), "model": model, "probe": probe, "keyless": pick.Keyless,
+			"select": pick.Keyless && !probe && term.IsTerminal(int(os.Stdin.Fd())),
 		}, &res)
 		if err != nil && res.Error == "" {
 			return err
@@ -440,6 +449,9 @@ a wrong URL or token fails here, in words. Kept in ~/.memdoor/providers.json
 		}
 		if res.FreeModel != "" {
 			fmt.Println("  " + ui.FreeModelNote(res.FreeModel))
+		}
+		if res.Selected != "" {
+			fmt.Printf("  pinned: new conversations start on %s. /model auto removes the pin.\n", res.Selected)
 		}
 		fmt.Println("  /model <id> in the window pins one of its models; memdoor model search <name> finds them.")
 		if res.Decisions {
