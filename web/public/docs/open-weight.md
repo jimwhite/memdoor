@@ -71,9 +71,10 @@ tokens per call; 4,096 on every call means the window of step 2 is not set.
 
 ## 5. The team on your GPU
 
-The [team-solve workflow](/docs/team-solve) names no model. The harness
-that scored 9.8 of 10 on LiveCodeBench Hard runs on whatever `connect
-local` found:
+The [team-solve workflow](/docs/team-solve) names no model. Its built-in
+version, `team-solve-v2`, runs the same team on whatever `connect local`
+found. The 9.8 of 10 on LiveCodeBench Hard is the original's, with the
+authors' prompts; v2 has no score of its own yet:
 
 ```
 mkdir my-problem && cd my-problem
